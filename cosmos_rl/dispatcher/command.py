@@ -493,6 +493,10 @@ class DataFetchCommand(Command):
     Used to fetch data from the controller.
     items_count: int,  Number of items to fetch.
     replica_name: str, Name of the replica to fetch data.
+    items_per_data_rank: Optional[List[int]], under budget dispatch the number of
+        items each data rank of the replica receives, in ``dp_shard`` rank order.
+        The controller published each rank's rollouts consecutively in that order.
+        None keeps the native even split of ``items_count`` across data ranks.
     """
 
     def __init__(
@@ -512,6 +516,7 @@ class DataFetchCommand(Command):
         profile_memory: Optional[bool] = None,
         with_stack: Optional[bool] = None,
         with_modules: Optional[bool] = None,
+        items_per_data_rank: Optional[List[int]] = None,
         **kwargs,
     ):
         kwargs["scope"] = CommandScope.LOCAL
@@ -522,6 +527,7 @@ class DataFetchCommand(Command):
         self.global_step = global_step
         self.total_steps = total_steps
         self.remain_samples_num = remain_samples_num
+        self.items_per_data_rank = items_per_data_rank
 
         self.do_save = do_save
 
@@ -539,6 +545,7 @@ class DataFetchCommand(Command):
     global_step: Optional[int]
     total_steps: Optional[int]
     remain_samples_num: int
+    items_per_data_rank: Optional[List[int]]
 
     do_save: bool
 
@@ -550,6 +557,17 @@ class DataFetchCommand(Command):
     with_stack: bool
     with_modules: bool
 
+    def pack(self):
+        """Serialize, omitting ``items_per_data_rank`` when unset.
+
+        ``from_dict`` passes every key to ``__init__``, so an older worker fails on
+        an unknown key; leaving the field out keeps native commands byte-identical.
+        """
+        payload = dict(self.__dict__)
+        if payload.get("items_per_data_rank") is None:
+            payload.pop("items_per_data_rank", None)
+        return msgpack.packb(payload)
+
     @classmethod
     def trigger(
         cls,
@@ -560,6 +578,7 @@ class DataFetchCommand(Command):
         remain_samples_num: int,
         do_save: bool,
         redis_handler: RedisStreamHandler,
+        items_per_data_rank: Optional[List[int]] = None,
     ):
         cmd = cls(
             replica.name,
@@ -575,6 +594,7 @@ class DataFetchCommand(Command):
             replica.sub_profiler_config.profile_memory,
             replica.sub_profiler_config.with_stack,
             replica.sub_profiler_config.with_modules,
+            items_per_data_rank=items_per_data_rank,
         )
         redis_handler.publish_command(cmd.pack(), replica.name)
 
