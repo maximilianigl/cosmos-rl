@@ -257,6 +257,15 @@ class Rollout(BaseModel):
         default=0, description="The weight version for the rollout."
     )
 
+    train_units: int = Field(
+        default=1,
+        description=(
+            "Training weight the controller assigns this rollout under budget "
+            "dispatch (train_units_per_data_rank), read from extra_info[train_units_key]. "
+            "Every rollout weighs 1 without a key; 0 retires the rollout without training."
+        ),
+    )
+
     report_metrics: Optional[Dict[str, Any]] = Field(
         default=None,
         description="The report_metrics for the rollout used for metrics collection and reporting.",

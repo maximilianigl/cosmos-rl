@@ -42,7 +42,7 @@ from cosmos_rl.dispatcher.status import (
     PolicyStatusManager,
     RolloutStatusManager,
 )
-from cosmos_rl.policy.config import Config, SubProfilerConfig
+from cosmos_rl.policy.config import Config, SubProfilerConfig, budget_dispatch_enabled
 from cosmos_rl.dispatcher.protocol import SetProfileRequest
 from cosmos_rl.utils.parallelism_map import ParallelizedShardMapper
 from cosmos_rl.dispatcher.data.schema import RLPayload
@@ -550,6 +550,9 @@ maxmemory-policy allkeys-lfu
             )
             return [], True
 
+        if not is_validation and budget_dispatch_enabled(self.config):
+            return self._get_batched_prompt_by_budget(n, rank_in_mesh)
+
         # Tag the prompt with specific weight-version for weight version control in on-policy training or outdated rollout control.
         rollouts_per_global_batch = self.config.train.train_batch_per_replica * len(
             self.policy_status_manager
@@ -775,6 +778,40 @@ maxmemory-policy allkeys-lfu
             is_end = True
 
         return payloads_list, is_end
+
+    def _get_batched_prompt_by_budget(
+        self, n: int, rank_in_mesh: Optional[int]
+    ) -> Tuple[List[RLPayload], bool]:
+        """Issue training prompts only while the assembling collection can take weight.
+
+        Once every data rank of the assembling collection is full, no new draws
+        are issued until the trainers take it; work already issued finishes into
+        the controller's pending queue, which is therefore bounded by the fleet's
+        capacity.  ``max_inflight_rollouts`` caps dispatched-but-uncompleted
+        rollouts.  Prompts carry the current step as a nominal weight version;
+        there is no per-version prompt quota, and the data fetcher keeps drawing
+        across dataset epochs until ``max_num_steps``.
+        """
+        status = self.policy_status_manager
+        if status.training_finished():
+            # Validation-enabled runs stop their rollouts through the final R2R
+            # broadcast; the prompt-stream end signal is the non-validation path.
+            return [], not self.config.validation.enable
+        if status.collection_complete():
+            return [], False
+        ceiling = self.config.train.train_policy.max_inflight_rollouts
+        if ceiling is not None and status.samples_on_the_fly >= ceiling:
+            return [], False
+        payloads_list, _is_end = self.data_fetcher.get_batched_prompt(
+            n, None, rank_in_mesh, weight_version=None
+        )
+        for payload in payloads_list:
+            payload.weight_version = status.current_step
+        status.samples_on_the_fly += (
+            len(payloads_list) * self.config.rollout.n_generation
+        )
+        status.prompts_dispatched_total += len(payloads_list)
+        return payloads_list, False
 
     async def set_profile(self, request: SetProfileRequest):
         replica = self.policy_status_manager[request.replica_name]

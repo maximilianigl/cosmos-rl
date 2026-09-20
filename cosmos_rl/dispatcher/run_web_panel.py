@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import sys
 import argparse
 import signal
 import socket
@@ -31,7 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, List, Optional, Callable, Union, Iterable
 from cosmos_rl.dispatcher.controller import Controller
 from cosmos_rl.dispatcher.command import StopCommand
-from cosmos_rl.dispatcher.status import should_broadcast_stop
+from cosmos_rl.dispatcher.status import CollectionStalledError, should_broadcast_stop
 import cosmos_rl.utils.constant as constant
 from cosmos_rl.dispatcher.protocol import MESH_NAMES
 from cosmos_rl.dispatcher.replica import Atom, Replica
@@ -114,6 +115,9 @@ def create_error_response(
 
 controller = Controller()
 server = None
+# Message of the controller-side failure that stopped the server, if any; ``main``
+# exits non-zero when set so the launcher fails the job.
+_fatal_error: Optional[str] = None
 # Set True on the first successful /register.  Guards heartbeat-reap finalize
 # against the startup window where replica managers are empty but workers have
 # not connected yet (notably SFT controllers where ``not is_rl`` is always true).
@@ -256,7 +260,21 @@ async def lifespan(app: FastAPI):
         stop_broadcast_sent = False
         while not shutdown_event.is_set():
             # Run in separate process
-            controller.policy_status_manager.maintain_life_status()
+            try:
+                controller.policy_status_manager.maintain_life_status()
+            except CollectionStalledError as error:
+                # A budget-dispatch collection that stops gaining training units
+                # would otherwise idle the job to its wall-clock limit.  Stop the
+                # server; ``main`` turns the recorded failure into a non-zero exit
+                # so the launcher fails the job instead of treating the exit as
+                # a coordinated shutdown.
+                global _fatal_error
+                _fatal_error = str(error)
+                logger.error("[Controller] %s; shutting down the controller.", error)
+                shutdown_event.set()
+                if server is not None:
+                    server.should_exit = True
+                break
             controller.rollout_status_manager.maintain_life_status(
                 controller.policy_status_manager
             )
@@ -954,6 +972,9 @@ def main(
     global server
     server = uvicorn.Server(config)
     server.run(sockets=[listen_sock])
+    if _fatal_error is not None:
+        logger.error("[Controller] Exiting with failure: %s", _fatal_error)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

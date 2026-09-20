@@ -25,7 +25,7 @@ import datasets
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, TensorDataset
 
 from cosmos_rl.dispatcher.data.packer.base import BaseDataPacker
-from cosmos_rl.policy.config import Config
+from cosmos_rl.policy.config import Config, budget_dispatch_enabled
 from cosmos_rl.dispatcher.data import (
     CosmosDataset,
     RLDataset,
@@ -560,7 +560,12 @@ class ControllerDataFetcher(DataFetcherBase):
                             self.train_sampler.set_epoch(self.epoch)
                         if hasattr(self.batch_sampler, "set_epoch"):
                             self.batch_sampler.set_epoch(self.epoch)
-                        if self.epoch <= self.config.train.epoch:
+                        # Budget dispatch is bounded by max_num_steps, not by
+                        # epochs: keep drawing across dataset traversals.
+                        if (
+                            self.epoch <= self.config.train.epoch
+                            or budget_dispatch_enabled(self.config)
+                        ):
                             logger.info(f"[Controller] Epoch {self.epoch} start.")
                             iterator = iter(self.train_dataloader)
                             self.train_dataloader_iter = iterator

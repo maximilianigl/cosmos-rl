@@ -607,6 +607,50 @@ class GrpoConfig(BaseModel):
         ),
     )
 
+    train_units_per_data_rank: Optional[int] = Field(
+        default=None,
+        description=(
+            "Enable budget dispatch. Instead of handing every policy replica "
+            "train_batch_per_replica rollouts, the controller assigns each completed "
+            "rollout to the least-filled data rank until every data rank holds at "
+            "least this many training units, then dispatches the whole collection. "
+            "A rollout is never split, so a rank can overshoot by less than one "
+            "rollout. Disaggregated GRPO only; requires train.max_num_steps because "
+            "prompt draws continue across dataset epochs until that step count, and "
+            "leaves train_batch_per_replica unused. None keeps the fixed-count dispatch."
+        ),
+    )
+
+    train_units_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Budget dispatch only: the extra_info key each rollout carries its integer "
+            "training weight under (a per-completion list on the RolloutResult). A "
+            "rollout weighing 0 is retired without training but still took part in "
+            "its group's reward and advantage. None weighs every rollout 1."
+        ),
+    )
+
+    max_inflight_rollouts: Optional[int] = Field(
+        default=None,
+        description=(
+            "Budget dispatch only: hard ceiling on rollouts dispatched to workers but "
+            "not yet completed. Completed rollouts leave this count on arrival at the "
+            "controller, not at the training ACK, so a deficient collection can always "
+            "request replacements. None disables the ceiling."
+        ),
+    )
+
+    collection_no_progress_timeout_s: Optional[float] = Field(
+        default=None,
+        description=(
+            "Budget dispatch only: fail the controller when completions arrive but "
+            "none adds training units to the assembling collection for this many "
+            "seconds. The clock starts at a collection's first completion and restarts "
+            "whenever a rollout with positive weight is assigned. None disables it."
+        ),
+    )
+
     min_filter_prefix_tokens: Optional[int] = Field(
         default=None,
         description="Minimum number of tokens to filter the prefix tokens for the rollouts inside the same group. "
@@ -718,7 +762,59 @@ class GrpoConfig(BaseModel):
                     self.variant
                 )
             )
+        if self.train_units_per_data_rank is not None:
+            if self.train_units_per_data_rank < 1:
+                raise ValueError("train_units_per_data_rank must be positive when set")
+            if self.variant == "dapo":
+                raise ValueError("Budget dispatch does not support the dapo variant")
+            if self.data_dispatch_as_rank_in_mesh:
+                raise ValueError(
+                    "Budget dispatch assigns rollouts to data ranks itself; disable "
+                    "data_dispatch_as_rank_in_mesh"
+                )
+            if self.uncentralized_training:
+                raise ValueError(
+                    "Budget dispatch routes rollouts through the controller; disable "
+                    "uncentralized_training"
+                )
+            if self.on_policy:
+                raise ValueError(
+                    "Budget dispatch has no per-step prompt quota; disable on_policy"
+                )
+            if (
+                self.max_inflight_rollouts is not None
+                and self.max_inflight_rollouts < 1
+            ):
+                raise ValueError("max_inflight_rollouts must be positive when set")
+            if (
+                self.collection_no_progress_timeout_s is not None
+                and self.collection_no_progress_timeout_s <= 0
+            ):
+                raise ValueError(
+                    "collection_no_progress_timeout_s must be positive when set"
+                )
+        elif (
+            self.train_units_key is not None
+            or self.max_inflight_rollouts is not None
+            or self.collection_no_progress_timeout_s is not None
+        ):
+            raise ValueError(
+                "train_units_key, max_inflight_rollouts and "
+                "collection_no_progress_timeout_s require train_units_per_data_rank"
+            )
         return self
+
+
+def budget_dispatch_enabled(config: "Config") -> bool:
+    """Whether the controller dispatches rollouts by training weight.
+
+    Budget dispatch is a GRPO-only feature; SFT and other train policies never
+    carry the field.
+    """
+    return (
+        getattr(config.train.train_policy, "train_units_per_data_rank", None)
+        is not None
+    )
 
 
 class SubProfilerConfig(BaseModel):
@@ -2008,6 +2104,24 @@ class Config(BaseModel):
                 assert batch % mb == 0, (
                     f"train_batch_per_replica ({batch}) must be divisible by "
                     f"mini_batch ({mb}). Set mini_batch <= train_batch_per_replica."
+                )
+
+        if budget_dispatch_enabled(self):
+            if self.mode == "colocated":
+                raise ValueError(
+                    "Budget dispatch (train_units_per_data_rank) requires mode=disaggregated; "
+                    "colocated rollouts never pass through the controller's dispatch."
+                )
+            if self.train.max_num_steps is None:
+                raise ValueError(
+                    "Budget dispatch requires train.max_num_steps: prompt draws continue "
+                    "across dataset epochs until that step count, so the epoch count "
+                    "cannot bound the run."
+                )
+            if self.train.ckpt.save_freq_in_epoch > 0:
+                raise ValueError(
+                    "Budget dispatch does not support epoch-based checkpointing "
+                    "(ckpt.save_freq_in_epoch); use ckpt.save_freq."
                 )
 
         # Validate constraints for GRPO with LoRA

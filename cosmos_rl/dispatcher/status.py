@@ -18,11 +18,11 @@ import math
 from collections import OrderedDict
 from queue import Empty, Queue
 from strenum import StrEnum
-from typing import Dict, List, Iterator, Any, Optional, Callable
+from typing import Dict, List, Iterator, Any, Optional, Callable, Tuple
 from cosmos_rl.utils.constant import COSMOS_HEARTBEAT_TIMEOUT
 from cosmos_rl.utils.logging import logger
 from cosmos_rl.utils.util import RollingDict
-from cosmos_rl.policy.config import Config
+from cosmos_rl.policy.config import Config, budget_dispatch_enabled
 from cosmos_rl.dispatcher.replica import Replica, Atom, Rollout
 from cosmos_rl.dispatcher.protocol import MESH_NAMES, Role
 import cosmos_rl.dispatcher.command as command
@@ -211,6 +211,15 @@ def should_coalesce_skip(
     return last_staged_step > max_adopted_version
 
 
+class CollectionStalledError(RuntimeError):
+    """A budget-dispatch collection stopped gaining training units.
+
+    Raised from the controller's life-status scan so the job fails with the
+    per-rank deficits instead of idling; see
+    ``PolicyStatusManager.check_collection_progress``.
+    """
+
+
 class ReplicaScalingEnum(StrEnum):
     """
     Enum for replica scaling event.
@@ -315,6 +324,22 @@ class PolicyStatusManager:
         # policy ACK set, keeping samples_on_the_fly accounting symmetric.
         self.dispatched_rollouts_by_step: Dict[int, int] = {}
 
+        # Budget dispatch (``train_units_per_data_rank``): the collection
+        # assembling for the next real training command, one rollout list per
+        # data rank of the arrived replicas in replica start order.  Each rank
+        # fills up to the budget; a whole rollout may overshoot it.  Completed
+        # rollouts that find every rank full wait in ``rollout_buffer`` for the
+        # next collection.  See ``_assign_pending_rollouts``.
+        self.collection_assignments: List[List[Rollout]] = []
+        self.collection_filled_units: List[int] = []
+        self.collection_started_at: Optional[float] = None
+        self.collection_last_progress_at: Optional[float] = None
+        self.collection_zero_unit_rollouts = 0
+        self.zero_unit_rollouts_total = 0
+        self.dispatched_rollouts_total = 0
+        self.prompts_dispatched_total = 0
+        self.dispatched_train_units_by_step: Dict[int, List[int]] = {}
+
         self.status = {}
 
         self.train_report_data = RollingDict(maxlen=20)
@@ -394,6 +419,8 @@ class PolicyStatusManager:
         self.data_fetcher = data_fetcher
 
         self.recompute_total_steps()
+        if self.budget_dispatch:
+            self._reset_collection()
         # For resume case to activate dataloader and validation if needed
         if (
             self.config.train.resume
@@ -470,6 +497,7 @@ class PolicyStatusManager:
                 dead_replicas.add(replica.name)
         for replica_name in dead_replicas:
             self.unregister(replica_name)
+        self.check_collection_progress(now)
 
     def set_status(self, name: str, status: PolicyStatus):
         """
@@ -505,19 +533,17 @@ class PolicyStatusManager:
             if explicit_num_remaining_samples is not None
             else self.remain_samples_num
         )
-
-        steps_by_dataset = self.current_step + num_remaining_samples // (
-            self.config.train.train_batch_per_replica * num_policy_replicas
+        self.total_steps = self._total_steps_from_remaining_samples(
+            num_remaining_samples
         )
-
-        # If max_num_steps is set, honour the smaller one.
-        if self.config.train.max_num_steps is not None:
-            self.total_steps = min(steps_by_dataset, self.config.train.max_num_steps)
-        else:
-            self.total_steps = steps_by_dataset
 
     def _total_steps_from_remaining_samples(self, num_remaining_samples: int) -> int:
         """Compute ``total_steps`` from a sample count without mutating state."""
+        if self.budget_dispatch:
+            # Collections consume a data-dependent number of rollouts and prompt
+            # draws continue across dataset epochs, so only the explicit step
+            # bound (required by the config validator) defines the horizon.
+            return self.config.train.max_num_steps
         num_policy_replicas = len(self.get_all_atoms_arrived_replicas())
         if num_policy_replicas == 0:
             return self.total_steps
@@ -561,6 +587,20 @@ class PolicyStatusManager:
             self.try_trigger_data_fetch_and_training()
             if self.current_step > previous_step:
                 return
+
+        if self.budget_dispatch and self.current_step < frozen_total:
+            # The prompt source closed while a collection was still deficient.
+            # No undersized training command is published; the run completes at
+            # the steps it did train and the deficit is left in the log.
+            logger.error(
+                "[Controller] Rollout input ended with the collection for step %d "
+                "deficient: filled units per data rank=%s deficits=%s pending "
+                "rollouts=%d; completing training without it.",
+                self.current_step + 1,
+                self.collection_filled_units,
+                self.collection_deficits(),
+                self.rollout_buffer.qsize(),
+            )
 
         self.cleanup_buffered_rollouts()
         if self.real_terminal_command_acked():
@@ -906,6 +946,11 @@ class PolicyStatusManager:
     def rearrange_rollout_buffer_after_mesh_rebuild(
         self, sorted_valid_replicas: List[Replica]
     ):
+        if self.budget_dispatch:
+            # The data-rank layout changed with the replica set; redistribute
+            # whatever the assembling collection already held.
+            self._assign_pending_rollouts()
+            return
         # Only handle the case when data dispatch as rank in mesh is enabled for GRPO
         # Currently SFT does not support rank specific data dispatch
         if self.config.train.train_policy.data_dispatch_as_rank_in_mesh:
@@ -1134,6 +1179,10 @@ class PolicyStatusManager:
         """
         if self.config.train.train_policy.data_dispatch_as_rank_in_mesh:
             return sum(q.qsize() for q in self.rollout_buffer_per_rank)
+        if self.budget_dispatch:
+            return self.rollout_buffer.qsize() + sum(
+                len(assigned) for assigned in self.collection_assignments
+            )
         return self.rollout_buffer.qsize()
 
     def next_rollout_training_step(self) -> int:
@@ -1145,6 +1194,10 @@ class PolicyStatusManager:
         new admission report; generation weight alone does not when outdated
         rollouts are allowed.
         """
+        if self.budget_dispatch:
+            # A new completion joins the assembling collection, or the one after
+            # it once every rank of the assembling collection is full.
+            return self.current_step + (2 if self.collection_complete() else 1)
 
         required_rollouts = self.config.train.train_batch_per_replica * max(
             len(self.get_all_atoms_arrived_replicas()), 1
@@ -1346,6 +1399,11 @@ class PolicyStatusManager:
                     dropped.append(rollout_queue.get_nowait())
                 except Empty:
                     break
+        # Assigned but undispatched collection members are buffered work too.
+        for assigned in self.collection_assignments:
+            dropped.extend(assigned)
+            assigned.clear()
+        self.collection_filled_units = [0] * len(self.collection_assignments)
         return self._discard_rollouts(dropped, "terminal_buffer_cleanup")
 
     def cleanup_terminal_rollouts(
@@ -1422,6 +1480,21 @@ class PolicyStatusManager:
             # Dispatch based on prompt idx
             target_rank = rollout.prompt_idx % len(self.rollout_buffer_per_rank)
             self.rollout_buffer_per_rank[target_rank].put(rollout)
+        elif self.budget_dispatch:
+            rollout.train_units = self._train_units_of(rollout)
+            now = time.time()
+            if self.collection_last_progress_at is None:
+                # The no-progress clock starts with a collection's first completion.
+                self.collection_last_progress_at = now
+            if rollout.train_units == 0:
+                # Retire without training: the rollout already took part in its
+                # group's reward and advantage, but has nothing for the trainer.
+                self.collection_zero_unit_rollouts += 1
+                self.zero_unit_rollouts_total += 1
+                self._publish_payload_transport_cleanup([rollout], [])
+            else:
+                self.rollout_buffer.put(rollout)
+                self._assign_pending_rollouts()
         else:
             self.rollout_buffer.put(rollout)
         self.try_trigger_data_fetch_and_training()
@@ -1462,6 +1535,17 @@ class PolicyStatusManager:
                     # Do not break: keep admitting any remaining rollouts in
                     # this batch. They are valid data for the next step and
                     # dropping them starves the consumer.
+
+        if self.budget_dispatch and n_samples > 0:
+            # Under budget dispatch a completion settles its in-flight slot on
+            # arrival, so a deficient collection can keep requesting replacements
+            # while it holds every rollout the fleet has finished. The training
+            # ACK therefore settles nothing (see ``train_ack``).
+            before = self.samples_on_the_fly
+            self.samples_on_the_fly = max(0, before - n_samples)
+            _log_samples_on_the_fly_mutation(
+                "completion", before, self.samples_on_the_fly
+            )
 
         return completion_tokens_count, n_samples
 
@@ -1575,12 +1659,17 @@ class PolicyStatusManager:
             # Estimate the step when this rollout will be used for training
             # This is estimated based on the current step, the number of pending rollouts,
             # and the number of rollouts before this rollout in the current batch.
-            estimated_step = self.current_step + (
-                idx + self.total_pending_rollouts()
-            ) // (
-                self.config.train.train_batch_per_replica
-                * max(len(self.get_all_atoms_arrived_replicas()), 1)
-            )
+            if self.budget_dispatch:
+                # Collections have no fixed size; the earliest step this rollout
+                # can train in is the one being assembled.
+                estimated_step = self.current_step + 1
+            else:
+                estimated_step = self.current_step + (
+                    idx + self.total_pending_rollouts()
+                ) // (
+                    self.config.train.train_batch_per_replica
+                    * max(len(self.get_all_atoms_arrived_replicas()), 1)
+                )
             staleness = estimated_step - rollout.weight_version
             if staleness <= allowed_outdated_steps:
                 filtered_rollouts.append(rollout)
@@ -1826,9 +1915,12 @@ class PolicyStatusManager:
             _dispatch_record = self.dispatched_rollouts_by_step.pop(
                 step, _missing_dispatch
             )
-            _train_decrement = (
+            self.dispatched_train_units_by_step.pop(step, None)
+            _dispatched_count = (
                 0 if _dispatch_record is _missing_dispatch else _dispatch_record
             )
+            # Budget dispatch settled these rollouts when they completed.
+            _train_decrement = 0 if self.budget_dispatch else _dispatched_count
             if _dispatch_record is _missing_dispatch and step not in (
                 self.total_steps,
                 self.total_steps - 1,
@@ -1863,7 +1955,7 @@ class PolicyStatusManager:
                 getattr(self.config, "mode", None) != "colocated"
                 and not self.config.validation.enable
                 and _dispatch_record is not _missing_dispatch
-                and _train_decrement > 0
+                and _dispatched_count > 0
             ):
                 self.record_real_datafetch_acked(step, total_steps)
             # All replicas have been reduced; decide whether to weight-sync.
@@ -1979,7 +2071,7 @@ class PolicyStatusManager:
                         ]
                     )
                     logger.info(
-                        f"[Controller] Train report data from total {self.config.train.train_batch_per_replica * len(self.get_all_atoms_arrived_replicas())} rollouts: {report_data_str}"
+                        f"[Controller] Train report data from total {_dispatched_count} rollouts: {report_data_str}"
                     )
 
                     if "wandb" in self.config.logging.logger and is_wandb_available():
@@ -2182,6 +2274,10 @@ class PolicyStatusManager:
                 for q in self.rollout_buffer_per_rank
             )
 
+        if self.budget_dispatch:
+            self._assign_pending_rollouts()
+            return self.collection_complete()
+
         return self.total_pending_rollouts() >= (
             self.config.train.train_batch_per_replica
             * len(self.get_all_atoms_arrived_replicas())
@@ -2237,6 +2333,10 @@ class PolicyStatusManager:
             return
 
         training_horizon = self.training_horizon()
+
+        if self.budget_dispatch:
+            self._try_trigger_budget_training(arrived_replicas, training_horizon)
+            return
 
         items_count = self.config.train.train_batch_per_replica
         required_rollouts = items_count * len(arrived_replicas)
@@ -2317,51 +2417,292 @@ class PolicyStatusManager:
             # Report the reward, length, etc.
             # These properties are already ready to be reported before being trained
             if self.config.logging.logger and rollouts_of_this_step:
-                rewards = []
-                completion_lengths = []
-                advantages = []
-                filter_rewards = []
-                for rollout in rollouts_of_this_step:
-                    rewards.append(rollout.reward)
-                    completion_length = (
-                        (
-                            len(rollout.completion_token_ids)
-                            if self.config.train.train_policy.rollout_as_token_ids
-                            else len(self.tokenizer.encode(rollout.completion))
-                        )
-                        if not self.config.train.non_text
-                        else 1
-                    )
-                    advantages.extend([rollout.advantage] * completion_length)
-                    filter_rewards.append(rollout.filter_reward)
-                    completion_lengths.append(completion_length)
-                report_data = {
-                    "train/reward_mean": np.mean(rewards),
-                    "train/reward_std": np.std(rewards),
-                    "train/reward_max": np.max(rewards),
-                    "train/reward_min": np.min(rewards),
-                    "rollout/completion_length_mean": np.mean(completion_lengths),
-                    "rollout/completion_length_std": np.std(completion_lengths),
-                    "rollout/completion_length_max": np.max(completion_lengths),
-                    "rollout/completion_length_min": np.min(completion_lengths),
-                    "rollout/advantage_mean": np.mean(advantages),
-                    "rollout/advantage_std": np.std(advantages),
-                    "rollout/advantage_max": np.max(advantages),
-                    "rollout/advantage_min": np.min(advantages),
-                    "rollout/filter_reward_mean": np.mean(filter_rewards),
-                    "rollout/filter_reward_std": np.std(filter_rewards),
-                    "rollout/filter_reward_max": np.max(filter_rewards),
-                    "rollout/filter_reward_min": np.min(filter_rewards),
-                }
-
-                report_data_list = [
-                    rollout.report_metrics if rollout.report_metrics is not None else {}
-                    for rollout in rollouts_of_this_step
-                ]
-                report_data = aggregate_report_data(
-                    report_data_list, report_data, prefix="train/"
+                self.train_report_data[self.current_step] = (
+                    self._dispatched_rollout_report(rollouts_of_this_step)
                 )
-                self.train_report_data[self.current_step] = report_data
+
+    def _dispatched_rollout_report(
+        self, rollouts_of_this_step: List[Rollout]
+    ) -> Dict[str, Any]:
+        """Summarize reward, length, and advantage statistics of a dispatched step."""
+        rewards = []
+        completion_lengths = []
+        advantages = []
+        filter_rewards = []
+        for rollout in rollouts_of_this_step:
+            rewards.append(rollout.reward)
+            completion_length = (
+                (
+                    len(rollout.completion_token_ids)
+                    if self.config.train.train_policy.rollout_as_token_ids
+                    else len(self.tokenizer.encode(rollout.completion))
+                )
+                if not self.config.train.non_text
+                else 1
+            )
+            advantages.extend([rollout.advantage] * completion_length)
+            filter_rewards.append(rollout.filter_reward)
+            completion_lengths.append(completion_length)
+        report_data = {
+            "train/reward_mean": np.mean(rewards),
+            "train/reward_std": np.std(rewards),
+            "train/reward_max": np.max(rewards),
+            "train/reward_min": np.min(rewards),
+            "rollout/completion_length_mean": np.mean(completion_lengths),
+            "rollout/completion_length_std": np.std(completion_lengths),
+            "rollout/completion_length_max": np.max(completion_lengths),
+            "rollout/completion_length_min": np.min(completion_lengths),
+            "rollout/advantage_mean": np.mean(advantages),
+            "rollout/advantage_std": np.std(advantages),
+            "rollout/advantage_max": np.max(advantages),
+            "rollout/advantage_min": np.min(advantages),
+            "rollout/filter_reward_mean": np.mean(filter_rewards),
+            "rollout/filter_reward_std": np.std(filter_rewards),
+            "rollout/filter_reward_max": np.max(filter_rewards),
+            "rollout/filter_reward_min": np.min(filter_rewards),
+        }
+
+        report_data_list = [
+            rollout.report_metrics if rollout.report_metrics is not None else {}
+            for rollout in rollouts_of_this_step
+        ]
+        return aggregate_report_data(report_data_list, report_data, prefix="train/")
+
+    # ------------------------------------------------------------------
+    # Budget dispatch: each rollout carries an integer weight (``train_units``),
+    # each data rank a budget (``train_units_per_data_rank``); the controller
+    # fills every rank to its budget with whole rollouts before dispatching.
+    # ------------------------------------------------------------------
+
+    @property
+    def budget_dispatch(self) -> bool:
+        """Whether rollouts are dispatched by training weight instead of a fixed count."""
+        return budget_dispatch_enabled(self.config)
+
+    def _collection_data_ranks(self) -> List[Tuple[Replica, int]]:
+        """Return ``(replica, data rank within the replica)`` in dispatch order.
+
+        Replicas are ordered by start time, like ``BuildMeshCommand`` orders the
+        mesh; a replica's data ranks are its ``dp_shard`` coordinates, the order
+        the policy worker splits its rollout stream by.
+        """
+        data_ranks: List[Tuple[Replica, int]] = []
+        for replica in sorted(
+            self.get_all_atoms_arrived_replicas(), key=lambda x: x.start_time
+        ):
+            for local_rank in range(replica.data_rank_count()):
+                data_ranks.append((replica, local_rank))
+        return data_ranks
+
+    def _ensure_collection_layout(self) -> bool:
+        """Size the collection to the current data ranks; return whether any exist.
+
+        A changed replica set (registration, scaling, heartbeat reap) returns every
+        assigned rollout to the front of the pending queue so ``_assign_pending_rollouts``
+        redistributes it: nothing is lost or left bound to a departed rank.
+        """
+        data_rank_count = len(self._collection_data_ranks())
+        if data_rank_count == 0:
+            return False
+        if len(self.collection_assignments) != data_rank_count:
+            assigned = [
+                rollout
+                for rank_rollouts in self.collection_assignments
+                for rollout in rank_rollouts
+            ]
+            pending: List[Rollout] = []
+            while True:
+                try:
+                    pending.append(self.rollout_buffer.get_nowait())
+                except Empty:
+                    break
+            for rollout in assigned + pending:
+                self.rollout_buffer.put(rollout)
+            self.collection_assignments = [[] for _ in range(data_rank_count)]
+            self.collection_filled_units = [0] * data_rank_count
+        return True
+
+    def _reset_collection(self) -> None:
+        """Start assembling a new collection; the pending queue feeds it."""
+        data_rank_count = len(self.collection_assignments)
+        self.collection_assignments = [[] for _ in range(data_rank_count)]
+        self.collection_filled_units = [0] * data_rank_count
+        self.collection_started_at = time.time()
+        self.collection_last_progress_at = None
+        self.collection_zero_unit_rollouts = 0
+
+    def collection_complete(self) -> bool:
+        """Whether every data rank of the assembling collection has reached its budget."""
+        budget = self.config.train.train_policy.train_units_per_data_rank
+        return bool(self.collection_filled_units) and all(
+            filled >= budget for filled in self.collection_filled_units
+        )
+
+    def collection_deficits(self) -> List[int]:
+        """Return the training units each data rank still lacks."""
+        budget = self.config.train.train_policy.train_units_per_data_rank
+        return [max(0, budget - filled) for filled in self.collection_filled_units]
+
+    def _assign_pending_rollouts(self) -> None:
+        """Move pending rollouts onto the least-filled data ranks until every rank is full.
+
+        Ties break toward the lower rank index. A rollout is never split, so the
+        rank taking it may overshoot the budget by less than one rollout. Pending
+        rollouts left over wait for the next collection.
+        """
+        if not self._ensure_collection_layout():
+            return
+        while not self.collection_complete():
+            try:
+                rollout = self.rollout_buffer.get_nowait()
+            except Empty:
+                return
+            rank = min(
+                range(len(self.collection_filled_units)),
+                key=lambda index: (self.collection_filled_units[index], index),
+            )
+            self.collection_assignments[rank].append(rollout)
+            self.collection_filled_units[rank] += rollout.train_units
+            self.collection_last_progress_at = time.time()
+
+    def _train_units_of(self, rollout: Rollout) -> int:
+        """Read a rollout's integer training weight from its ``extra_info``."""
+        key = self.config.train.train_policy.train_units_key
+        if key is None:
+            return 1
+        extra_info = rollout.extra_info or {}
+        if key not in extra_info:
+            raise ValueError(
+                f"[Controller] Rollout prompt_idx={rollout.prompt_idx} carries no "
+                f"extra_info[{key!r}]; budget dispatch needs one integer weight per rollout"
+            )
+        units = extra_info[key]
+        if isinstance(units, bool) or not isinstance(units, int) or units < 0:
+            raise ValueError(
+                f"[Controller] Rollout prompt_idx={rollout.prompt_idx} has "
+                f"extra_info[{key!r}]={units!r}; expected a non-negative integer"
+            )
+        return units
+
+    def check_collection_progress(self, now: float) -> None:
+        """Raise ``CollectionStalledError`` when completions stop adding training units.
+
+        The clock starts at a collection's first completion and restarts whenever
+        a rollout with positive weight is assigned, so a stream of zero-weight
+        completions fails after ``collection_no_progress_timeout_s`` while a
+        slow but productive collection does not. Nothing is checked before the
+        trainers' data-rank layout exists.
+        """
+        if not self.budget_dispatch:
+            return
+        timeout = self.config.train.train_policy.collection_no_progress_timeout_s
+        if (
+            timeout is None
+            or self.training_finished()
+            or self.collection_last_progress_at is None
+            or not self._ensure_collection_layout()
+            or self.collection_complete()
+        ):
+            return
+        stalled_for = now - self.collection_last_progress_at
+        if stalled_for <= timeout:
+            return
+        raise CollectionStalledError(
+            f"Collection for training step {self.current_step + 1} gained no training "
+            f"units for {stalled_for:.0f}s (collection_no_progress_timeout_s={timeout:g}): "
+            f"assigned rollouts={sum(len(a) for a in self.collection_assignments)} "
+            f"zero-unit rollouts={self.collection_zero_unit_rollouts} "
+            f"pending rollouts={self.rollout_buffer.qsize()} "
+            f"outstanding rollouts={self.samples_on_the_fly} "
+            f"filled units per data rank={self.collection_filled_units} "
+            f"deficits={self.collection_deficits()}"
+        )
+
+    def _try_trigger_budget_training(
+        self, arrived_replicas: List[Replica], training_horizon: int
+    ) -> None:
+        """Dispatch the assembled collection once every rank is full and every trainer ready.
+
+        Each replica receives its data ranks' rollouts consecutively in rank
+        order plus the per-rank counts on the ``DataFetchCommand``; the policy
+        worker splits its stream by those counts.
+        """
+        if not (self.all_ready_or_reduced() and self.rollouts_enough_for_one_step()):
+            return
+
+        counts_per_replica: Dict[str, List[int]] = {
+            replica.name: [] for replica in arrived_replicas
+        }
+        rollouts_of_this_step: List[Rollout] = []
+        for (replica, _local_rank), assigned in zip(
+            self._collection_data_ranks(), self.collection_assignments
+        ):
+            counts_per_replica[replica.name].append(len(assigned))
+            for rollout in assigned:
+                replica.put_rollout(rollout, self.redis_handler)
+            rollouts_of_this_step.extend(assigned)
+        filled_units = list(self.collection_filled_units)
+
+        self.remain_samples_num -= len(rollouts_of_this_step)
+        self.current_step += 1
+        self.dispatched_rollouts_by_step[self.current_step] = len(rollouts_of_this_step)
+        self.dispatched_train_units_by_step[self.current_step] = filled_units
+        self.dispatched_rollouts_total += len(rollouts_of_this_step)
+
+        if self.config.validation.enable and (
+            self.current_step % self.config.validation.freq == 0
+            or self.current_step == training_horizon
+        ):
+            self.data_fetcher.validation_activate_dataloader(self.current_step)
+
+        do_save = self.check_checkpoint_saving(len(rollouts_of_this_step))
+        for replica in arrived_replicas:
+            counts = counts_per_replica[replica.name]
+            command.DataFetchCommand.trigger(
+                replica=replica,
+                items_count=sum(counts),
+                global_step=self.current_step,
+                total_steps=training_horizon,
+                remain_samples_num=self.remain_samples_num,
+                do_save=do_save,
+                redis_handler=self.redis_handler,
+                items_per_data_rank=counts,
+            )
+            self.set_status(replica.name, PolicyStatus.RUNNING)
+
+        collection_seconds = time.time() - (self.collection_started_at or time.time())
+        logger.info(
+            "[Controller] Dispatched budget collection for step %d: rollouts=%d "
+            "train_units per data rank=%s zero-unit rollouts=%d collection_seconds=%.1f "
+            "pending rollouts=%d outstanding rollouts=%d",
+            self.current_step,
+            len(rollouts_of_this_step),
+            filled_units,
+            self.collection_zero_unit_rollouts,
+            collection_seconds,
+            self.rollout_buffer.qsize(),
+            self.samples_on_the_fly,
+        )
+        if self.config.logging.logger and rollouts_of_this_step:
+            report_data = self._dispatched_rollout_report(rollouts_of_this_step)
+            report_data.update(
+                {
+                    "dispatch/rollouts": len(rollouts_of_this_step),
+                    "dispatch/train_units_min": min(filled_units),
+                    "dispatch/train_units_max": max(filled_units),
+                    "dispatch/zero_unit_rollouts": self.collection_zero_unit_rollouts,
+                    "dispatch/collection_seconds": collection_seconds,
+                    "dispatch/pending_rollouts": self.rollout_buffer.qsize(),
+                    "dispatch/outstanding_rollouts": self.samples_on_the_fly,
+                    "dispatch/prompts_total": self.prompts_dispatched_total,
+                    "dispatch/rollouts_total": self.dispatched_rollouts_total,
+                    "dispatch/zero_unit_rollouts_total": self.zero_unit_rollouts_total,
+                }
+            )
+            self.train_report_data[self.current_step] = report_data
+
+        self._reset_collection()
+        self._assign_pending_rollouts()
 
 
 class RolloutStatusManager:

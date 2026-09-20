@@ -193,6 +193,9 @@ class RLPolicyWorker(PolicyWorkerBase):
         # For rollouts fetch
         self.data_queue = Queue()
         self.replica_batch_for_this_step = 0
+        # Budget dispatch: the controller's per-data-rank rollout counts for the
+        # current step, None under the native even split.
+        self.replica_items_per_data_rank: Optional[List[int]] = None
 
         # For Polocy to Rollout weight mapping
         self.policy_to_rollout_insts = None
@@ -690,6 +693,7 @@ class RLPolicyWorker(PolicyWorkerBase):
 
         assert self.replica_name == command.replica_name
         self.replica_batch_for_this_step = command.items_count
+        self.replica_items_per_data_rank = command.items_per_data_rank
 
         do_save_checkpoint = command.do_save
         if (
@@ -743,6 +747,7 @@ class RLPolicyWorker(PolicyWorkerBase):
 
         assert self.replica_name == command.replica_name
         self.replica_batch_for_this_step = 0
+        self.replica_items_per_data_rank = None
         report_data = {}
         logger.info(
             f"[Policy] Training complete at global step {command.global_step}, skip training."
@@ -953,6 +958,29 @@ class RLPolicyWorker(PolicyWorkerBase):
 
         rollouts = [[]]
         scattered_rollouts = [[] for _ in range(self.world_size)]
+
+        if self.replica_items_per_data_rank is not None:
+            # Budget dispatch: the controller published each data rank's rollouts
+            # consecutively in dp rank order, so rank 0 consumes the whole stream
+            # and hands the first counts[0] to data rank 0, the next counts[1] to
+            # data rank 1, and so on.  Counts differ per rank.
+            counts = self.replica_items_per_data_rank
+            assert len(counts) == self.dp_world_size, (
+                f"[Policy] Controller sent {len(counts)} per-data-rank counts for "
+                f"{self.dp_world_size} data ranks"
+            )
+            if self.global_rank == 0:
+                for dp_id, count in enumerate(counts):
+                    for _ in range(count):
+                        rollout = self.data_queue.get(block=True, timeout=None)
+                        for i in range(self.world_size):
+                            if self.parallel_dims.get_rank_in_dim("dp", i) == dp_id:
+                                scattered_rollouts[i].append(rollout)
+            if self.world_size == 1:
+                return preprocess_rollouts(scattered_rollouts[0])
+            dist.scatter_object_list(rollouts, scattered_rollouts, src=0)
+            return preprocess_rollouts(rollouts[0])
+
         batch_for_this_step = (
             self.replica_batch_for_this_step // self.dp_world_size * self.dp_world_size
         )
