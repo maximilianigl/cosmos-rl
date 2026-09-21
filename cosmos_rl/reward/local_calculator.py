@@ -37,11 +37,9 @@ def _training_payload_from_rollouts(
 ) -> RLPayload:
     admission = rollout_group.completion_admission
     assert admission is not None
+    # extra_info travels with the payload whether or not the producer opted into
+    # admission: budget dispatch reads each rollout's training weight from it.
     selected = select_payload_completions(source_payload, admission)
-    if not admission.explicit:
-        # Preserve the historical local-reward payload shape when no producer
-        # opts into admission. The old reconstruction did not forward extra_info.
-        selected.extra_info = None
     selected.reference_answer = None
     selected.valid = valid
     selected.completions = [rollout.completion for rollout in rollouts]
