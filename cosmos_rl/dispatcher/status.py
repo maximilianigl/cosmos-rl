@@ -588,7 +588,11 @@ class PolicyStatusManager:
             if self.current_step > previous_step:
                 return
 
-        if self.budget_dispatch and self.current_step < frozen_total:
+        if (
+            self.budget_dispatch
+            and not self.dispatch_incomplete_collections
+            and self.current_step < frozen_total
+        ):
             # The prompt source closed while a collection was still deficient.
             # No undersized training command is published; the run completes at
             # the steps it did train and the deficit is left in the log.
@@ -829,6 +833,11 @@ class PolicyStatusManager:
         valid_replicas = self.get_all_atoms_arrived_replicas()
         if replica.in_mesh and len(valid_replicas) > 0:
             self.trigger_rebuild_mesh(valid_replicas)
+            if self.dispatch_incomplete_collections:
+                # The survivors may already be ready and waiting on a completion
+                # that a replay-pool trainer does not need.  Losing a peer is the
+                # other transition that leaves them with nothing to wake them.
+                self.try_trigger_data_fetch_and_training()
 
     def register(
         self,
@@ -1082,6 +1091,14 @@ class PolicyStatusManager:
                 redis_handler=self.redis_handler,
             )
             self.set_status(target_replica.name, PolicyStatus.READY)
+
+        if self.dispatch_incomplete_collections:
+            # Replicas that just turned READY may have nothing left to wait for:
+            # the other dispatch points are a rollout completion and a training
+            # ACK, and a trainer serving itself from a replay pool needs neither.
+            # This is the transition that starts such a run and that resumes it
+            # after a rescale.
+            self.try_trigger_data_fetch_and_training()
 
     def validation_report_validation_results(
         self,
@@ -2276,6 +2293,12 @@ class PolicyStatusManager:
 
         if self.budget_dispatch:
             self._assign_pending_rollouts()
+            if self.dispatch_incomplete_collections:
+                # The trainers hold their own replay pool, so every moment they
+                # are all ready is a valid dispatch point: hand over whatever the
+                # collection holds, even nothing.  The data-rank layout is all
+                # that is required, since each rank needs a count.
+                return self._ensure_collection_layout()
             return self.collection_complete()
 
         return self.total_pending_rollouts() >= (
@@ -2478,6 +2501,23 @@ class PolicyStatusManager:
     def budget_dispatch(self) -> bool:
         """Whether rollouts are dispatched by training weight instead of a fixed count."""
         return budget_dispatch_enabled(self.config)
+
+    @property
+    def dispatch_incomplete_collections(self) -> bool:
+        """Whether a ready trainer set is dispatched to even with a deficient collection.
+
+        The budget then only gates prompt issue (``_get_batched_prompt_by_budget``
+        pauses while the assembling collection is full); it no longer gates
+        training.  For trainers that keep their own replay pool and can train on
+        a command carrying no rollouts at all.
+        """
+        return self.budget_dispatch and bool(
+            getattr(
+                self.config.train.train_policy,
+                "dispatch_incomplete_collections",
+                False,
+            )
+        )
 
     def _collection_data_ranks(self) -> List[Tuple[Replica, int]]:
         """Return ``(replica, data rank within the replica)`` in dispatch order.

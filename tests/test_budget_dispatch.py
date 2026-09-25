@@ -17,7 +17,11 @@ from unittest.mock import MagicMock, patch
 import msgpack
 import pytest
 
-from cosmos_rl.dispatcher.command import DataFetchCommand
+from cosmos_rl.dispatcher.command import (
+    BuildMeshCommand,
+    DataFetchCommand,
+    TrainingCompleteCommand,
+)
 from cosmos_rl.dispatcher.controller import Controller
 from cosmos_rl.dispatcher.data.schema import RLPayload, Rollout
 from cosmos_rl.dispatcher.status import (
@@ -39,11 +43,13 @@ def _config(
     max_num_steps=10,
     timeout=None,
     ceiling=None,
+    dispatch_incomplete=False,
     logger=("console",),
 ):
     return SimpleNamespace(
         mode="disaggregated",
-        validation=SimpleNamespace(enable=False, freq=1),
+        policy=SimpleNamespace(parallelism=SimpleNamespace(n_init_replicas=1)),
+        validation=SimpleNamespace(enable=False, freq=1, val_before_train=False),
         logging=SimpleNamespace(logger=list(logger)),
         rollout=SimpleNamespace(
             n_generation=N_GENERATION, include_stop_str_in_output=False
@@ -73,6 +79,7 @@ def _config(
                 train_units_key=key,
                 max_inflight_rollouts=ceiling,
                 collection_no_progress_timeout_s=timeout,
+                dispatch_incomplete_collections=dispatch_incomplete,
             ),
         ),
     )
@@ -122,9 +129,9 @@ def _rollout(prompt_idx, units, key="units"):
     )
 
 
-def _rollout_status():
+def _rollout_status(*, ended=False):
     return SimpleNamespace(
-        all_rollouts_ended=lambda: False,
+        all_rollouts_ended=lambda: ended,
         get_safe_weight_sync_replicas=lambda validation_enabled: [],
     )
 
@@ -432,6 +439,192 @@ def test_terminal_cleanup_releases_assigned_collection_members():
     assert cleaned == rollouts
 
 
+@pytest.mark.parametrize("dispatch_incomplete", [True, False])
+def test_ready_trainers_are_dispatched_to_at_registration_only_under_the_flag(
+    dispatch_incomplete,
+):
+    """Trainers holding their own replay pool are never woken by a completion.
+
+    Registration is the one transition that makes every replica READY without a
+    rollout in sight, so it must publish the first command itself.
+    """
+    replicas = [_replica("p0", 0, data_ranks=2)]
+    config = _config(budget=4, dispatch_incomplete=dispatch_incomplete)
+    manager = _manager(config, replicas)
+    manager.data_fetcher.set_policy_global_mesh_size = MagicMock()
+
+    with _DispatchRecorder() as dispatch, patch.object(BuildMeshCommand, "trigger"):
+        manager.post_register_hook(replicas, replicas[0], config, _rollout_status())
+
+    if not dispatch_incomplete:
+        assert dispatch.commands == []
+        assert manager.current_step == 0
+        return
+
+    assert manager.current_step == 1
+    assert len(dispatch.commands) == 1
+    assert dispatch.commands[0]["items_count"] == 0
+    assert dispatch.commands[0]["items_per_data_rank"] == [0, 0]
+    assert manager.dispatched_rollouts_by_step == {1: 0}
+    assert manager.dispatched_train_units_by_step == {1: [0, 0]}
+    assert manager.all_with_status([PolicyStatus.RUNNING])
+    # Nothing was trained on, so there is no rollout report for the step.
+    assert 1 not in manager.train_report_data
+
+
+def test_losing_a_peer_dispatches_to_the_ready_survivors():
+    """Reaping a replica is the other transition no completion follows."""
+    replicas = [_replica("p0", 0), _replica("p1", 1)]
+    for replica in replicas:
+        replica.in_mesh = True
+    manager = _manager(_config(budget=4, dispatch_incomplete=True), replicas)
+    manager.get_all_atoms_arrived_replicas = lambda: [
+        replica for replica in replicas if replica.name in manager.policy_replicas
+    ]
+    manager.data_fetcher.set_policy_global_mesh_size = MagicMock()
+
+    with _DispatchRecorder() as dispatch, patch.object(BuildMeshCommand, "trigger"):
+        manager.unregister("p1")
+
+    assert [command["replica"].name for command in dispatch.commands] == ["p0"]
+    assert dispatch.commands[0]["items_per_data_rank"] == [0]
+    assert manager.current_step == 1
+
+
+def test_incomplete_collection_is_dispatched_and_the_surplus_opens_the_next_one():
+    replicas = [_replica("p0", 0), _replica("p1", 1)]
+    manager = _manager(
+        _config(budget=4, dispatch_incomplete=True), replicas, samples_on_the_fly=10
+    )
+    for replica in replicas:
+        manager.status[replica.name] = PolicyStatus.RUNNING
+
+    with _DispatchRecorder() as dispatch:
+        # Trainers busy: four 3-unit rollouts fill both ranks past the budget and
+        # the fifth waits for the next collection.
+        manager.put_rollouts([_rollout(index, 3) for index in range(5)])
+        assert manager.current_step == 0
+        assert manager.collection_filled_units == [6, 6]
+
+        for replica in replicas:
+            manager.status[replica.name] = PolicyStatus.READY
+        manager.try_trigger_data_fetch_and_training()
+        assert manager.current_step == 1
+        # The surplus opens the next collection, which is deficient but still
+        # dispatched as soon as the trainers come back.
+        assert manager.collection_filled_units == [3, 0]
+
+        for replica in replicas:
+            manager.status[replica.name] = PolicyStatus.READY
+        manager.try_trigger_data_fetch_and_training()
+
+    assert manager.current_step == 2
+    assert manager.dispatched_rollouts_by_step == {1: 4, 2: 1}
+    assert manager.dispatched_train_units_by_step[2] == [3, 0]
+    by_name = {command["replica"].name: command for command in dispatch.commands[-2:]}
+    assert by_name["p0"]["items_per_data_rank"] == [1]
+    assert by_name["p1"]["items_per_data_rank"] == [0]
+    assert by_name["p1"]["items_count"] == 0
+    assert manager.total_pending_rollouts() == 0
+
+
+def test_prompt_issue_still_pauses_while_the_collection_is_full():
+    """The budget keeps gating producers even when it no longer gates training."""
+    replicas = [_replica("p0", 0)]
+    config = _config(budget=4, dispatch_incomplete=True)
+    manager = _manager(config, replicas)
+    controller = object.__new__(Controller)
+    controller.config = config
+    controller.policy_status_manager = manager
+    controller.rollout_status_manager = SimpleNamespace(replica_scaling_log=[])
+    controller.data_fetcher = SimpleNamespace(
+        get_batched_prompt=MagicMock(
+            side_effect=lambda n, *args, **kwargs: (
+                [RLPayload(prompt_idx=index) for index in range(n)],
+                False,
+            )
+        )
+    )
+
+    manager.status["p0"] = PolicyStatus.RUNNING
+    with _DispatchRecorder():
+        manager.put_rollouts([_rollout(0, 4)])
+    assert manager.collection_complete()
+    assert asyncio.run(controller._get_batched_prompt_impl(3)) == ([], False)
+
+    manager.status["p0"] = PolicyStatus.READY
+    with _DispatchRecorder() as dispatch:
+        manager.try_trigger_data_fetch_and_training()
+    assert dispatch.commands[0]["items_count"] == 1
+    payloads, _ = asyncio.run(controller._get_batched_prompt_impl(2))
+    assert len(payloads) == 2
+
+
+def test_draining_keeps_stepping_to_the_frozen_horizon_without_rollouts():
+    replicas = [_replica("p0", 0)]
+    horizon = 3
+    manager = _manager(
+        _config(budget=4, max_num_steps=horizon, dispatch_incomplete=True), replicas
+    )
+    ended = _rollout_status(ended=True)
+
+    with (
+        _DispatchRecorder() as dispatch,
+        patch.object(TrainingCompleteCommand, "trigger") as completion,
+    ):
+        manager.finish_draining_phase(ended)
+        assert manager.current_step == 1
+        for expected_step in (2, 3):
+            manager.train_ack(
+                "p0", manager.current_step, horizon, False, _ack_report(1), ended
+            )
+            assert manager.current_step == expected_step
+        assert not completion.called
+        manager.train_ack("p0", horizon, horizon, False, _ack_report(1), ended)
+
+    assert [command["global_step"] for command in dispatch.commands] == [1, 2, 3]
+    assert all(command["items_count"] == 0 for command in dispatch.commands)
+    assert manager.training_finished()
+    assert completion.called
+
+
+def test_policy_worker_takes_nothing_when_every_per_rank_count_is_zero(monkeypatch):
+    worker = object.__new__(RLPolicyWorker)
+    worker.config = SimpleNamespace(
+        train=SimpleNamespace(
+            local_dataset=False,
+            train_policy=SimpleNamespace(
+                uncentralized_training=False, data_dispatch_as_rank_in_mesh=False
+            ),
+        )
+    )
+    worker.global_rank = 0
+    worker.parallel_dims = SimpleNamespace(get_rank_in_dim=lambda dim, rank: rank)
+    worker.replica_batch_for_this_step = 0
+    worker.data_queue = Queue()
+    scattered = {}
+
+    def fake_scatter(output, scatter_list, src):
+        scattered["list"] = scatter_list
+        output[0] = scatter_list[0]
+
+    monkeypatch.setattr(
+        "cosmos_rl.policy.worker.rl_worker.dist.scatter_object_list", fake_scatter
+    )
+
+    worker.world_size = 2
+    worker.dp_world_size = 2
+    worker.replica_items_per_data_rank = [0, 0]
+    assert worker.dispatch_rollouts() == []
+    assert scattered["list"] == [[], []]
+
+    # A single-rank replica never scatters; the empty stream must survive that too.
+    worker.world_size = 1
+    worker.dp_world_size = 1
+    worker.replica_items_per_data_rank = [0]
+    assert worker.dispatch_rollouts() == []
+
+
 def test_data_fetch_command_round_trips_per_rank_counts_and_omits_them_natively():
     replica = _replica("p0", 0)
     redis_handler = SimpleNamespace(publish_command=MagicMock())
@@ -450,6 +643,21 @@ def test_data_fetch_command_round_trips_per_rank_counts_and_omits_them_natively(
     command = DataFetchCommand.depack(packed)
     assert command.items_per_data_rank == [3, 2]
     assert command.items_count == 5
+
+    # A command that hands over nothing still carries one count per data rank.
+    DataFetchCommand.trigger(
+        replica=replica,
+        items_count=0,
+        global_step=3,
+        total_steps=10,
+        remain_samples_num=7,
+        do_save=False,
+        redis_handler=redis_handler,
+        items_per_data_rank=[0, 0],
+    )
+    empty = DataFetchCommand.depack(redis_handler.publish_command.call_args.args[0])
+    assert empty.items_per_data_rank == [0, 0]
+    assert empty.items_count == 0
 
     DataFetchCommand.trigger(
         replica=replica,
@@ -530,6 +738,8 @@ def test_grpo_config_rejects_incompatible_budget_dispatch_settings():
         GrpoConfig(type="grpo", train_units_per_data_rank=0)
     with pytest.raises(ValueError, match="require train_units_per_data_rank"):
         GrpoConfig(type="grpo", train_units_key="units")
+    with pytest.raises(ValueError, match="require train_units_per_data_rank"):
+        GrpoConfig(type="grpo", dispatch_incomplete_collections=True)
 
 
 def test_config_requires_disaggregated_step_bounded_budget_dispatch():
