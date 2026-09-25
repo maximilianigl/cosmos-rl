@@ -651,6 +651,19 @@ class GrpoConfig(BaseModel):
         ),
     )
 
+    dispatch_incomplete_collections: bool = Field(
+        default=False,
+        description=(
+            "Budget dispatch only: publish a training command whenever every policy "
+            "replica is ready, handing each data rank the rollouts assigned to it so "
+            "far, possibly none. The collection budget then only gates prompt issue "
+            "(producers pause while the assembling collection is full) and no longer "
+            "gates training. For trainers that keep their own replay pool. A collection "
+            "then resets at every command, so collection_no_progress_timeout_s only "
+            "measures a stall within one command window."
+        ),
+    )
+
     min_filter_prefix_tokens: Optional[int] = Field(
         default=None,
         description="Minimum number of tokens to filter the prefix tokens for the rollouts inside the same group. "
@@ -797,10 +810,12 @@ class GrpoConfig(BaseModel):
             self.train_units_key is not None
             or self.max_inflight_rollouts is not None
             or self.collection_no_progress_timeout_s is not None
+            or self.dispatch_incomplete_collections
         ):
             raise ValueError(
-                "train_units_key, max_inflight_rollouts and "
-                "collection_no_progress_timeout_s require train_units_per_data_rank"
+                "train_units_key, max_inflight_rollouts, "
+                "collection_no_progress_timeout_s and dispatch_incomplete_collections "
+                "require train_units_per_data_rank"
             )
         return self
 
