@@ -406,7 +406,9 @@ def test_local_reward_forwards_extra_info_without_explicit_admission():
         12,
         13,
     ]
-    assert all(rollout.extra_info["group"] == "metadata" for rollout in trainer_rollouts[0])
+    assert all(
+        rollout.extra_info["group"] == "metadata" for rollout in trainer_rollouts[0]
+    )
 
 
 def test_fully_rejected_group_preserves_excluded_reward_telemetry():
