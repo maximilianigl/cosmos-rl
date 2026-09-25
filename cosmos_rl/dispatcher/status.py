@@ -1972,7 +1972,6 @@ class PolicyStatusManager:
                 getattr(self.config, "mode", None) != "colocated"
                 and not self.config.validation.enable
                 and _dispatch_record is not _missing_dispatch
-                and _dispatched_count > 0
             ):
                 self.record_real_datafetch_acked(step, total_steps)
             # All replicas have been reduced; decide whether to weight-sync.
@@ -1989,70 +1988,18 @@ class PolicyStatusManager:
                 logger.debug(f"[Controller] Unset the profile mode of {replica_name}")
                 self[replica_name].sub_profiler_config.do_profile = False
 
-            # Sum and report data
-            if self.config.logging.logger and not all(
-                [not data for data in self.report_data_list]
-            ):
+            # Each ACK batch belongs to one command, including data-only commands.
+            reports, self.report_data_list = self.report_data_list, []
+            if (self.config.logging.logger or self.custom_logger_fns) and any(reports):
                 try:
-                    total_loss_avg = np.mean(
-                        [data["train/loss_avg"] for data in self.report_data_list]
-                    )
-                    total_loss_max = np.max(
-                        [data["train/loss_max"] for data in self.report_data_list]
-                    )
-                    total_learning_rate = self.report_data_list[0][
-                        "train/learning_rate"
-                    ]
-                    total_iter_time_avg = np.mean(
-                        [data["train/iteration_time"] for data in self.report_data_list]
-                    )
-                    # KL loss
-                    total_kl_loss_avg = np.mean(
-                        [
-                            data.get("train/kl_loss_avg", 0)
-                            for data in self.report_data_list
-                        ]
-                    )
-                    total_kl_loss_max = np.max(
-                        [
-                            data.get("train/kl_loss_max", 0)
-                            for data in self.report_data_list
-                        ]
-                    )
-                    total_grad_norm = np.mean(
-                        [
-                            data.get("train/grad_norm", 0)
-                            for data in self.report_data_list
-                        ]
-                    )
-                    total_entropy = np.mean(
-                        [data.get("train/entropy", 0) for data in self.report_data_list]
-                    )
-                    total_effective_entropy = np.mean(
-                        [
-                            data.get("train/effective_entropy", 0)
-                            for data in self.report_data_list
-                        ]
-                    )
-                    train_step = self.report_data_list[0]["train_step"]
-                    policy_report_data = {
-                        "train/loss_avg": total_loss_avg,
-                        "train/loss_max": total_loss_max,
-                        "train/learning_rate": total_learning_rate,
-                        "train/iteration_time": total_iter_time_avg,
-                        "train/kl_loss_avg": total_kl_loss_avg,
-                        "train/kl_loss_max": total_kl_loss_max,
-                        "train/grad_norm": total_grad_norm,
-                        "train/entropy": total_entropy,
-                        "train/effective_entropy": total_effective_entropy,
-                        "train/total_steps": total_steps,
-                    }
+                    train_step = step
                     policy_report_data = aggregate_report_data(
-                        self.report_data_list, policy_report_data
+                        reports,
+                        {"train_step": train_step, "train/total_steps": total_steps},
                     )
                     policy_report_data.update(completion_admission_records)
                     if self.config.mode == "colocated":
-                        for data in self.report_data_list:
+                        for data in reports:
                             # Handle dynamic sampling statistics update in colocated mode
                             self.update_dynamic_sampling_statistics(data)
 
@@ -2078,7 +2025,6 @@ class PolicyStatusManager:
                     self.train_report_data.setdefault(train_step, {}).update(
                         policy_report_data
                     )
-                    self.report_data_list = []
 
                     report_data_str = ", ".join(
                         [
@@ -2088,7 +2034,7 @@ class PolicyStatusManager:
                         ]
                     )
                     logger.info(
-                        f"[Controller] Train report data from total {_dispatched_count} rollouts: {report_data_str}"
+                        f"[Controller] Step {train_step}/{total_steps} report from {_dispatched_count} rollouts: {report_data_str}"
                     )
 
                     if "wandb" in self.config.logging.logger and is_wandb_available():
@@ -2134,14 +2080,6 @@ class PolicyStatusManager:
                             data=self.train_report_data[train_step],
                             step=train_step,
                         )
-                    if "console" in self.config.logging.logger:
-                        logger.info(
-                            f"Step: {train_step}/{total_steps}, Reward Mean: {self.train_report_data[train_step]['train/reward_mean']:.4f}, Reward Std: {self.train_report_data[train_step]['train/reward_std']:.4f}, Reward Max: {self.train_report_data[train_step]['train/reward_max']:.4f}, Reward Min: {self.train_report_data[train_step]['train/reward_min']:.4f}, Completion Length Mean: {self.train_report_data[train_step]['rollout/completion_length_mean']:.2f}, Completion Length Max: {self.train_report_data[train_step]['rollout/completion_length_max']:.2f}, Average loss: {total_loss_avg:.5f}, Max loss: {total_loss_max:.5f}, Learning rate: {total_learning_rate:.5e}, Entropy: {total_entropy:.5f}, Effective Entropy: {total_effective_entropy:.5f}, Grad Norm: {total_grad_norm:.5f}, KL Loss Avg: {total_kl_loss_avg:.5f}, KL Loss Max: {total_kl_loss_max:.5f}, Iteration time: {total_iter_time_avg:.2f}s."
-                        )
-                        if len(self.filter_records) > 0:
-                            logger.info(
-                                f"Dynamic sampling rewards distribution so far: {self.filter_records}."
-                            )
                     self.filter_records = {}
                     for custom_logger_fn in self.custom_logger_fns:
                         # We add a separate try-except block to handle the error of custom logger function.

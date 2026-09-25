@@ -576,16 +576,59 @@ def test_draining_keeps_stepping_to_the_frozen_horizon_without_rollouts():
         assert manager.current_step == 1
         for expected_step in (2, 3):
             manager.train_ack(
-                "p0", manager.current_step, horizon, False, _ack_report(1), ended
+                "p0",
+                manager.current_step,
+                horizon,
+                False,
+                _ack_report(manager.current_step),
+                ended,
             )
             assert manager.current_step == expected_step
         assert not completion.called
-        manager.train_ack("p0", horizon, horizon, False, _ack_report(1), ended)
+        manager.train_ack("p0", horizon, horizon, False, _ack_report(horizon), ended)
 
     assert [command["global_step"] for command in dispatch.commands] == [1, 2, 3]
     assert all(command["items_count"] == 0 for command in dispatch.commands)
     assert manager.training_finished()
-    assert completion.called
+    assert manager.real_terminal_command_acked()
+    assert manager.terminal_complete
+    assert not completion.called
+    assert not manager.completion_recipients
+    assert DataFetchCommand.replica_should_stop(
+        SimpleNamespace(global_step=horizon, total_steps=horizon)
+    )
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_reports_without_training_or_rollout_statistics_reach_custom_loggers(capture):
+    """Consecutive capture/replay reports keep their values and never invent losses/rewards."""
+    manager = _manager(
+        _config(budget=4, max_num_steps=3, dispatch_incomplete=True),
+        [_replica("p0", 0)],
+    )
+    reports = []
+    manager.custom_logger_fns = [
+        lambda report, step: reports.append((step, dict(report)))
+    ]
+    with _DispatchRecorder():
+        manager.try_trigger_data_fetch_and_training()
+        for step in (1, 2):
+            report = (
+                {"train_step": step, "train/seed_capture/groups": step * 4}
+                if capture
+                else {**_ack_report(step), "train/loss_avg": step * 0.1}
+            )
+            manager.train_ack("p0", step, 3, False, report, _rollout_status())
+            assert not manager.report_data_list
+
+    assert [step for step, _ in reports] == [1, 2]
+    for step, report in reports:
+        assert "train/reward_mean" not in report
+        if capture:
+            assert report["train/seed_capture/groups"] == step * 4
+            assert "train/loss_avg" not in report
+        else:
+            assert report["train/loss_avg"] == pytest.approx(step * 0.1)
 
 
 def test_policy_worker_takes_nothing_when_every_per_rank_count_is_zero(monkeypatch):
