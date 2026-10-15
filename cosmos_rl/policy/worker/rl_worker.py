@@ -958,12 +958,13 @@ class RLPolicyWorker(PolicyWorkerBase):
         rollouts = [[]]
         scattered_rollouts = [[] for _ in range(self.world_size)]
 
-        if self.replica_items_per_data_rank is not None:
+        items_per_data_rank = getattr(self, "replica_items_per_data_rank", None)
+        if items_per_data_rank is not None:
             # Budget dispatch: the controller published each data rank's rollouts
             # consecutively in dp rank order, so rank 0 consumes the whole stream
             # and hands the first counts[0] to data rank 0, the next counts[1] to
             # data rank 1, and so on.  Counts differ per rank.
-            counts = self.replica_items_per_data_rank
+            counts = items_per_data_rank
             assert len(counts) == self.dp_world_size, (
                 f"[Policy] Controller sent {len(counts)} per-data-rank counts for "
                 f"{self.dp_world_size} data ranks"

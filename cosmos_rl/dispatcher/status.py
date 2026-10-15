@@ -24,7 +24,11 @@ from typing import Dict, List, Iterator, Any, Optional, Callable, Tuple
 from cosmos_rl.utils.constant import COSMOS_HEARTBEAT_TIMEOUT
 from cosmos_rl.utils.logging import logger
 from cosmos_rl.utils.util import RollingDict
-from cosmos_rl.policy.config import Config, budget_dispatch_enabled
+from cosmos_rl.policy.config import (
+    Config,
+    budget_dispatch_enabled,
+    dispatch_incomplete_collections_enabled,
+)
 from cosmos_rl.dispatcher.replica import Replica, Atom, Rollout
 from cosmos_rl.dispatcher.protocol import MESH_NAMES, Role
 import cosmos_rl.dispatcher.command as command
@@ -438,7 +442,7 @@ class PolicyStatusManager:
         self.data_fetcher = data_fetcher
 
         self.recompute_total_steps()
-        if self.budget_dispatch:
+        if budget_dispatch_enabled(self.config):
             self._reset_collection()
         # For resume case to activate dataloader and validation if needed
         if (
@@ -1185,7 +1189,7 @@ class PolicyStatusManager:
             )
             self.set_status(target_replica.name, PolicyStatus.READY)
 
-        if self.dispatch_incomplete_collections:
+        if dispatch_incomplete_collections_enabled(self.config):
             # Replicas that just turned READY may have nothing left to wait for:
             # the other dispatch points are a rollout completion and a training
             # ACK, and a trainer serving itself from a replay pool needs neither.
@@ -2128,7 +2132,9 @@ class PolicyStatusManager:
 
             # Each ACK batch belongs to one command, including data-only commands.
             reports, self.report_data_list = self.report_data_list, []
-            if (self.config.logging.logger or self.custom_logger_fns) and any(reports):
+            if (
+                self.config.logging.logger or getattr(self, "custom_logger_fns", None)
+            ) and any(reports):
                 try:
                     train_step = step
                     policy_report_data = aggregate_report_data(
@@ -2583,20 +2589,8 @@ class PolicyStatusManager:
 
     @property
     def dispatch_incomplete_collections(self) -> bool:
-        """Whether a ready trainer set is dispatched to even with a deficient collection.
-
-        The budget then only gates prompt issue (``_get_batched_prompt_by_budget``
-        pauses while the assembling collection is full); it no longer gates
-        training.  For trainers that keep their own replay pool and can train on
-        a command carrying no rollouts at all.
-        """
-        return self.budget_dispatch and bool(
-            getattr(
-                self.config.train.train_policy,
-                "dispatch_incomplete_collections",
-                False,
-            )
-        )
+        """See ``dispatch_incomplete_collections_enabled``."""
+        return dispatch_incomplete_collections_enabled(self.config)
 
     def _collection_data_ranks(self) -> List[Tuple[Replica, int]]:
         """Return ``(replica, data rank within the replica)`` in dispatch order.

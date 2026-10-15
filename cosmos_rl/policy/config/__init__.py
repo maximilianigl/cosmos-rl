@@ -827,8 +827,24 @@ def budget_dispatch_enabled(config: "Config") -> bool:
     carry the field.
     """
     return (
-        getattr(config.train.train_policy, "train_units_per_data_rank", None)
+        getattr(
+            getattr(config.train, "train_policy", None),
+            "train_units_per_data_rank",
+            None,
+        )
         is not None
+    )
+
+
+def dispatch_incomplete_collections_enabled(config: "Config") -> bool:
+    """Whether a ready trainer set is dispatched to even with a deficient collection.
+
+    The budget then only gates prompt issue; it no longer gates training.  For
+    trainers that keep their own replay pool and can train on a command carrying
+    no rollouts at all.
+    """
+    return budget_dispatch_enabled(config) and bool(
+        getattr(config.train.train_policy, "dispatch_incomplete_collections", False)
     )
 
 
